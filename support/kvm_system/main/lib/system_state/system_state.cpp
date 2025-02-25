@@ -1,11 +1,49 @@
 #include "config.h"
 #include "system_state.h"
+#include <sys/socket.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 
 using namespace maix;
 using namespace maix::sys;
 
 extern kvm_sys_state_t kvm_sys_state;
 extern kvm_oled_state_t kvm_oled_state;
+
+int get_nic_state(const char* interface_name)
+{
+	int sock;
+	struct ifreq ifr;
+	int ret = NIC_STATE_NO_EXIST;
+	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		return ret;
+	}
+	strcpy(ifr.ifr_name, interface_name);
+	if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+		close(sock);
+		return ret;
+	}
+	if (ifr.ifr_flags & IFF_UP) {
+		if (ifr.ifr_flags & IFF_RUNNING) {
+			ret = NIC_STATE_RUNNING;
+		} else {
+			ret = NIC_STATE_UP;
+		}
+	} else {
+		ret = NIC_STATE_DOWN;
+	}
+	close(sock);
+	return ret;
+}
+
+int get_ping_allow_state()
+{
+	if(access("/etc/kvm/stop_ping", F_OK) == 0) {
+		kvm_sys_state.ping_allow = 0;
+	} else {
+		kvm_sys_state.ping_allow = 1;
+	}
+}
 
 // net_port
 int get_ip_addr(ip_addr_t ip_type)
@@ -162,73 +200,10 @@ void patch_eth_wifi(void)
 	// system("udhcpc -i eth0 &");
 }
 
-int kvm_eth_cable_exist()
-{
-	int temp;
-	FILE *fp;
-	int file_size;
-	uint8_t RW_Data[10];		
-	fp = fopen("/sys/class/net/eth0/carrier", "r");
-	fseek(fp, 0, SEEK_END);
-	file_size = ftell(fp); 
-	fseek(fp, 0, SEEK_SET);
-	fread(RW_Data, sizeof(char), file_size, fp);
-	fclose(fp);
-	if(RW_Data[0] == '0') return 0;
-	else if(RW_Data[0] == '1') return 1;
-	return -1;
-}
-
 int kvm_wifi_exist()
 {
-	// if(access("/sys/bus/sdio/devices/mmc1*", F_OK) == 0) return 1;
-	// else return 0;
-	uint8_t RW_Data[10];	
-	FILE *fp;
-	fp = popen("ifconfig | grep wlan", "r");
-	fgets((char*)RW_Data, 2, fp);
-	pclose(fp);
-	if(RW_Data[0] == 'w') return 1;
-	else return 0;
-}
-
-int kvm_rndis_exist()
-{
-	// if(access("/sys/kernel/config/usb_gadget/g0/configs/c.1/rndis.usb0", F_OK) == 0) return 1;
-	// else return 0;
-
-	int temp;
-	FILE *fp;
-	int file_size;
-	uint8_t RW_Data[10];		
-	fp = fopen("/sys/class/net/usb0/carrier", "r");
-	fseek(fp, 0, SEEK_END);
-	file_size = ftell(fp); 
-	fseek(fp, 0, SEEK_SET);
-	fread(RW_Data, sizeof(char), file_size, fp);
-	fclose(fp);
-	if(RW_Data[0] == '0') return 0;
-	else if(RW_Data[0] == '1') return 1;
-	return -1;
-}
-
-int kvm_tailscale_exist()
-{
-	// tailscale status
-
-	int temp;
-	FILE *fp;
-	int file_size;
-	uint8_t RW_Data[10];		
-	fp = fopen("ifconfig tailscale0 | grep 'inet addr' | awk '{print $2}'", "r");
-	fseek(fp, 0, SEEK_END);
-	file_size = ftell(fp); 
-	fseek(fp, 0, SEEK_SET);
-	fread(RW_Data, sizeof(char), file_size, fp);
-	fclose(fp);
-	if(RW_Data[0] == 'a') return 1;
-	else return 0;
-	return -1;
+	if (get_nic_state("wlan0") == NIC_STATE_NO_EXIST) return 0;
+	else return 1;
 }
 
 void kvm_update_usb_state()
@@ -375,136 +350,85 @@ void kvm_update_hdmi_res(void)
 
 void kvm_update_eth_state(void)
 {	
-	// 嗨得是老架构啊
-	static uint8_t eth_cable_state = 0;
-	// if(kvm_eth_cable_exist() == 1){
-	// 	if(eth_cable_state == 0){
-	// 		system("udhcpc -i eth0 &");
-	// 	}
-	// 	eth_cable_state = 1;
-	// } else {
-	// 	eth_cable_state = 0;
-	// }
-	eth_cable_state = kvm_eth_cable_exist();
+	static uint8_t nic_state = 0;
+	nic_state = get_nic_state("eth0");
 
-	if(eth_cable_state){
-		// 获取实时IP
+	if(nic_state == NIC_STATE_RUNNING){
+		// Get IP
 		if(strcmp(ip_address()["eth0"].c_str(), (char*)kvm_sys_state.eth_addr) != 0){
-		// if(1){
 			if(get_ip_addr(ETH_IP)){
 				kvm_sys_state.eth_state = 2;
 			} else {
 				kvm_sys_state.eth_state = 1;
 				return;
 			}
-			// OLED_ShowKVMStreamState(KVM_IP, kvm_sys_state.ip_addr);
 		}
-		// ping 网关
-		if(kvm_sys_state.eth_route[0] == 0){
-			get_ip_addr(ETH_ROUTE);
-		} else {
-			if(chack_net_state(ETH_ROUTE)){
-				// 网络通
-				kvm_sys_state.eth_state = 3;
+		if(kvm_sys_state.ping_allow){
+			// ping route
+			if(kvm_sys_state.eth_route[0] == 0){
+				get_ip_addr(ETH_ROUTE);
 			} else {
-				kvm_sys_state.eth_state = 2;
+				if(chack_net_state(ETH_ROUTE)){
+					// Ping successful
+					kvm_sys_state.eth_state = 3;
+				} else {
+					kvm_sys_state.eth_state = 2;
+				}
 			}
+		} else {
+			// Consider the network to be connected
+			kvm_sys_state.eth_state = 3;
 		}
 
 	} else {
 		kvm_sys_state.eth_state = 0;
 		patch_eth_wifi();
 	}
-
-	/*
-	switch (kvm_sys_state.eth_state){
-		case -1:
-		// 初始缺省值
-			kvm_sys_state.eth_state = 0;
-		case 0:
-		// 存在PHY
-			printf("kvm_update_eth_state case 0\n");
-			if (kvm_eth_cable_exist()) {
-				// 已插入
-				// system("udhcpc -i eth0 > /dev/null &");
-				kvm_sys_state.eth_state = 1;
-			} else break;
-			// break; // 消除短暂感叹号
-		case 1:
-		// 线缆已插入&无网络
-			if (get_ip_addr(ETH_IP)){
-				kvm_sys_state.eth_state = 2;
-			} else break;
-		case 2:
-		// 已获取ip
-			// system("udhcpc -i eth0 > /dev/null");
-			if (get_ip_addr(ETH_ROUTE) && chack_net_state(ETH_ROUTE)){
-				// ping 通
-				kvm_sys_state.eth_state = 3;
-			}
-			if (kvm_eth_cable_exist() == 0) {
-				// 未插入
-				kvm_sys_state.eth_state = 0;
-				patch_eth_wifi();
-			}
-			break;
-		case 3:
-		// 有网络&检测是否拔出/持续检测是否能ping通
-			if (kvm_sys_state.eth_route[0] != 0){
-				if (chack_net_state(ETH_ROUTE) == 0){
-					// ping不通
-					kvm_sys_state.eth_state = 2;
-					// patch_eth_wifi();
-				}
-			}
-			if (kvm_eth_cable_exist() == 0) {
-				// 未插入
-				kvm_sys_state.eth_state = 0;
-				patch_eth_wifi();
-			}
-			break;
-		default:
-			kvm_sys_state.eth_state = 0;
-	}
-	*/
 }
 
 void kvm_update_wifi_state(void)
 {	
-	// 无wifi模块(检测存在?)->有模块&未联网(检测是否联网)->
+	// No WiFi module (check for existence?) -> Module exists & not connected (check if connected) ->
 	if(kvm_sys_state.wifi_state == -2) return;
 	switch (kvm_sys_state.wifi_state){
 		case -1:
-		// 初始缺省值
+		// Initial default value.
 			if (kvm_wifi_exist()) {
 				kvm_sys_state.wifi_state = 0;
 				system("touch /etc/kvm/wifi_exist");
 			}
 			else {
-				kvm_sys_state.wifi_state = -2; // 不存在wifi模块,直接跳出
+				kvm_sys_state.wifi_state = -2; // WiFi module does not exist, exiting directly.
 				system("rm /etc/kvm/wifi_exist");
 				return;
 			}
-			// break;	// 直接开始检测联网
+			// break;	// Start checking the connection directly.
 		case 0:
-		// 存在WiFi&未联网
+		// WiFi is available but not connected.
 			system("echo 0 > /kvmapp/kvm/wifi_state");
 			if (get_ip_addr(WiFi_IP) && get_ip_addr(WiFi_ROUTE)){
-				// 已获取ip+route
-				if (chack_net_state(WiFi_ROUTE)){
-					// ping 通
+				// IP+Route has been acquired
+				if(kvm_sys_state.ping_allow){
+					if (chack_net_state(WiFi_ROUTE)){
+						// Ping successful
+						kvm_sys_state.wifi_state = 1;
+					}
+				} else {
+					// Consider the network to be connected
 					kvm_sys_state.wifi_state = 1;
 				}
 			}
 			break;
 		case 1:
-		// 已联网&持续检测是否能ping通
+		// Connected to the network & continuously checking if it can ping successfully.
 			system("echo 1 > /kvmapp/kvm/wifi_state");
 			get_ip_addr(WiFi_IP);
-			if (kvm_sys_state.wifi_route[0] != 0){
-				if (chack_net_state(WiFi_ROUTE) == 0){
-					// ping 通
-					kvm_sys_state.wifi_state = 0;
+			if(kvm_sys_state.ping_allow){
+				if (kvm_sys_state.wifi_route[0] != 0){
+					if (chack_net_state(WiFi_ROUTE) == 0){
+						// Ping successful
+						kvm_sys_state.wifi_state = 0;
+					}
 				}
 			}
 		// default:
@@ -514,8 +438,8 @@ void kvm_update_wifi_state(void)
 
 void kvm_update_rndis_state(void)
 {
-	if (kvm_rndis_exist()) {
-		if(kvm_sys_state.rndis_state != 1){
+	if (get_nic_state("usb0") == NIC_STATE_RUNNING) {
+		if(kvm_sys_state.rndis_state != 1) {
 			if (get_ip_addr(RNDIS_IP)) {
 				kvm_sys_state.rndis_state = 1;
 			}
@@ -526,7 +450,7 @@ void kvm_update_rndis_state(void)
 
 void kvm_update_tailscale_state(void)
 {
-	if (kvm_tailscale_exist()) {
+	if (get_nic_state("tailscale0") == NIC_STATE_RUNNING) {
 		if(kvm_sys_state.tail_state != 1){
 			if (get_ip_addr(Tailscale_IP)) {
 				kvm_sys_state.tail_state = 1;

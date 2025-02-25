@@ -19,6 +19,8 @@
 #define KVMV_MAX_TRY_NUM	   	2
 #define vi_min_width            32
 #define vi_min_height           3
+#define vi_max_width            1920
+#define vi_max_height           1080
 
 #define default_vi_width        1920
 #define default_vi_height       1080
@@ -39,6 +41,8 @@
 #define LT6911_ADDR 	0x2B
 #define LT6911_READ 	0xFF
 #define LT6911_WRITE 	0x00
+
+pthread_mutex_t vi_mutex;
 
 static char NanoKVM_edit[] = {
 	0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x41,0x0C,0x33,0xC2,0x66,0xBA,0x00,0x00,
@@ -79,6 +83,7 @@ typedef struct {
     uint8_t hdmi_reading_flag = 0;
     uint8_t hdmi_mode = 0;
     uint8_t vi_detect_state = 0;
+    uint8_t venc_auto_recyc = 0;
 } kvmv_cfg_t;
 
 typedef struct {
@@ -292,6 +297,19 @@ int get_manual_resolution(void)
         tmp_height = vi_min_height;
 	    char Cmd[100]={0};
         sprintf(Cmd, "echo %d > %s", vi_min_height, vi_height_path);
+	    system(Cmd);
+    }
+    // res max limit
+    if(tmp_width > vi_max_width){
+        tmp_width = vi_max_width;
+	    char Cmd[100]={0};
+        sprintf(Cmd, "echo %d > %s", vi_max_width, vi_width_path);
+	    system(Cmd);
+    }
+    if(tmp_height > vi_max_height){
+        tmp_height = vi_max_height;
+	    char Cmd[100]={0};
+        sprintf(Cmd, "echo %d > %s", vi_max_height, vi_height_path);
 	    system(Cmd);
     }
 
@@ -1298,6 +1316,7 @@ int8_t raw_to_h264(image::Image *raw, kvmv_data_t* ret_stream, uint16_t _qlty)
 void kvmv_init(uint8_t _debug_info_en)
 {
     pthread_t thread;
+    pthread_mutex_init(&vi_mutex, NULL);
     if(_debug_info_en == 0) debug_en = 0;
     else                    debug_en = 1;
 
@@ -1349,6 +1368,11 @@ uint8_t check_kvmv(uint8_t _try_num)
     return 1;
 }
 
+void set_venc_auto_recyc(uint8_t _enable)
+{
+    if(_enable) kvmv_cfg.venc_auto_recyc = 1;
+    else kvmv_cfg.venc_auto_recyc = 0;
+}
 
 /**********************************************************************************
  * @name    kvmv_read_img
@@ -1363,6 +1387,7 @@ uint8_t check_kvmv(uint8_t _try_num)
  * @param	_pp_kvm_data		@output: 	Encode data
  * @param	_p_kvmv_data_size	@output: 	Encode data size
  * @return
+        -5: Retrieving image, please wait
         -4: Modifying image resolution, please wait
         -3: img buffer full
         -2: VENC Errorl
@@ -1376,7 +1401,18 @@ uint8_t check_kvmv(uint8_t _try_num)
 int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _qlty, uint8_t** _pp_kvm_data, uint32_t* _p_kvmv_data_size)
 {
 	// uint64_t __attribute__((unused)) start_time = time::time_ms();
+    debug("[kvmv]kvmv_read_img type = %d...\n", _type);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    // pthread_mutex_lock(&vi_mutex);         // Add lock
+    int mutex_res = pthread_mutex_timedlock(&vi_mutex, &ts);
+    if(mutex_res != 0){
+        return -5;
+    }
+
     if (kvmv_cfg.vi_detect_state == 1){
+        pthread_mutex_unlock(&vi_mutex);
         return -4;
     }
     uint8_t try_num = 0;
@@ -1427,15 +1463,26 @@ int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _ql
 			delete img;
             debug("[kvmv]can`t get img...\n");
             continue;
+            // pthread_mutex_unlock(&vi_mutex);
+            // return IMG_NOT_EXIST;
         }
         // debug("[kvmv]cheak img null?: %d \r\n", (int)(time::time_ms() - start_time));
 
         // img exist
         // Encode
-        if(_type == VENC_H264 && kvmv_cfg.venc_type != _type){
+        if(kvmv_cfg.venc_type == VENC_MJPEG && kvmv_cfg.venc_type != _type){
+            if(kvmv_cfg.venc_auto_recyc == 1){
+                mmf_enc_jpg_deinit(0);
+            }
             kvm_venc.enc_h264_init = 1;
-            // debug("[kvmv] change to h264\n");
         }
+        if(kvmv_cfg.venc_type == VENC_H264 && kvmv_cfg.venc_type != _type){
+            if(kvmv_cfg.venc_auto_recyc == 1){
+                mmf_del_venc_channel(kvm_venc.mmf_venc_chn);
+            }
+            kvm_venc.enc_h264_init = 0;
+        }
+
         kvmv_cfg.venc_type = _type;
 
         if(kvmv_cfg.venc_type == VENC_MJPEG){
@@ -1447,6 +1494,7 @@ int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _ql
 			    delete img;
                 debug("[kvmv]jpg buffer full\n");
                 *_pp_kvm_data = NULL;
+                pthread_mutex_unlock(&vi_mutex);
                 return IMG_BUFFER_FULL;
             } 
             jpg_dump(p_kvmv_data, jpg);
@@ -1454,6 +1502,7 @@ int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _ql
 			delete img;
             *_pp_kvm_data = p_kvmv_data->p_img_data;
             *_p_kvmv_data_size = p_kvmv_data->img_data_size;
+            pthread_mutex_unlock(&vi_mutex);
             return IMG_MJPEG_TYPE;
         } else if (kvmv_cfg.venc_type == VENC_H264){
             int ret;
@@ -1462,6 +1511,7 @@ int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _ql
                 // buffer full
 			    delete img;
                 *_pp_kvm_data = NULL;
+                pthread_mutex_unlock(&vi_mutex);
                 return IMG_BUFFER_FULL;
             } 
             // debug("[kvmv]get_save_buffer: %d \r\n", (int)(time::time_ms() - start_time));
@@ -1470,11 +1520,13 @@ int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _ql
 			delete img;
             *_pp_kvm_data = p_kvmv_data->p_img_data;
             *_p_kvmv_data_size = p_kvmv_data->img_data_size;
+            pthread_mutex_unlock(&vi_mutex);
             return ret;
         }
     } while (check_kvmv(try_num++));
     // debug("[kvmv]return: %d \r\n", (int)(time::time_ms() - start_time));
     *_pp_kvm_data = NULL;
+    pthread_mutex_unlock(&vi_mutex);
     return IMG_NOT_EXIST;
 }
 
@@ -1545,6 +1597,7 @@ void free_all_kvmv_data()
 
 void kvmv_deinit()
 {
+    pthread_mutex_destroy(&vi_mutex);
     kvmv_cfg.try_exit_thread = 1;
     cam->close();
     mmf_deinit();
